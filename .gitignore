@@ -1,0 +1,18 @@
+venv/
+# Environment variables — API keys live here, NEVER commit
+.env
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+
+# Database file
+*.db
+
+# Mac system file
+.DS_Store
+
+# IDE files
+.vscode/
+.idea/
