@@ -1,0 +1,14 @@
+
+version: "3.9"
+
+services:
+  gemini-agent:
+    build: .
+    container_name: gemini-multi-agent
+    ports:
+      - "8000:8000"
+    environment:
+      - GROQ_API_KEY=${GROQ_API_KEY}
+    volumes:
+      - ./meetings.db:/app/meetings.db
+    restart: unless-stopped

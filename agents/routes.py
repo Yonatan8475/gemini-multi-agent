@@ -1,4 +1,3 @@
-
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional, Any, Dict
@@ -6,6 +5,7 @@ import sys
 import os
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from main import app as langgraph_app
 from database.db import (
     save_meeting,
     get_all_meetings,
@@ -109,14 +109,12 @@ def process_meeting(request: TranscriptRequest):
 
     # Run LangGraph pipeline
     try:
-        from main import pipeline as langgraph_app
         result = langgraph_app.invoke({
             "transcript": request.transcript,
             "summary": "",
             "tasks": [],
             "report": ""
         })
-    
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Pipeline error: {str(e)}")
 
