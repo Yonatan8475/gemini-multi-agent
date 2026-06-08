@@ -1,5 +1,7 @@
 # agents/transcriber.py
 # Save this as: agents/transcriber.py
+# agents/transcriber.py
+# Save this as: agents/transcriber.py
 
 import os
 from groq import Groq
@@ -50,3 +52,5 @@ if __name__ == "__main__":
     print("Transcriber Agent 0 — Ready")
     print("Languages: English (en), Amharic (am), Auto-detect (auto)")
     print("Model: Groq Whisper Large V3")
+
+

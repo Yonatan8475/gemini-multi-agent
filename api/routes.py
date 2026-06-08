@@ -1,5 +1,5 @@
-
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, UploadFile, File, Form
+from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel
 from typing import List, Optional, Any, Dict
 import sys
@@ -44,10 +44,27 @@ class TaskItem(BaseModel):
 
 
 class MeetingResponse(BaseModel):
-    meeting_id: int          # ← now returned so client can look it up later
+    meeting_id: int
     summary: str
     tasks: List[TaskItem]
     report: str
+
+
+class TranscriptionResponse(BaseModel):
+    transcript: str
+    language: str
+    duration: float
+
+
+class TranscribeAndProcessResponse(BaseModel):
+    meeting_id: int
+    transcript: str
+    language: str
+    duration: float
+    summary: str
+    tasks: List[TaskItem]
+    report: str
+    report_text: str    # the full formatted .txt content
 
 
 class SummaryOnlyResponse(BaseModel):
@@ -83,7 +100,7 @@ def normalize_tasks(raw_tasks: Any) -> List[Dict]:
 
 
 # ─────────────────────────────────────────────
-# ROUTES
+# HEALTH
 # ─────────────────────────────────────────────
 
 @router.get("/health", response_model=HealthResponse, tags=["Health"])
@@ -91,7 +108,225 @@ def health_check():
     return {"status": "ok", "message": "Gemini Multi-Agent API is running."}
 
 
-# ── MAIN PIPELINE ──────────────────────────────
+# ─────────────────────────────────────────────
+# TRANSCRIPTION — Agent 0
+# ─────────────────────────────────────────────
+
+@router.post(
+    "/transcribe",
+    response_model=TranscriptionResponse,
+    tags=["Transcription"],
+    summary="Transcribe audio to text — English or Amharic"
+)
+async def transcribe_audio_endpoint(
+    file: UploadFile = File(...),
+    language: str = Form(default="en")
+):
+    """
+    Accepts an audio file and returns the transcript.
+
+    Language options:
+    - "en"   -> English
+    - "am"   -> Amharic
+    - "auto" -> Auto-detect
+
+    Supported formats: webm, mp3, wav, m4a, ogg
+    """
+    if not file:
+        raise HTTPException(status_code=422, detail="No audio file provided.")
+
+    audio_bytes = await file.read()
+
+    if len(audio_bytes) == 0:
+        raise HTTPException(status_code=422, detail="Audio file is empty.")
+
+    try:
+        from agents.transcriber import transcribe_audio
+        result = transcribe_audio(audio_bytes, language)
+        return TranscriptionResponse(
+            transcript=result["transcript"],
+            language=result.get("language", language),
+            duration=result.get("duration", 0.0)
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Transcription error: {str(e)}")
+
+
+@router.post(
+    "/transcribe-and-process",
+    response_model=TranscribeAndProcessResponse,
+    tags=["Transcription"],
+    summary="Transcribe audio AND run full 3-agent pipeline — returns formatted report"
+)
+async def transcribe_and_process(
+    file: UploadFile = File(...),
+    language: str = Form(default="en")
+):
+    """
+    The all-in-one endpoint:
+    1. Transcribes audio using Groq Whisper (English or Amharic)
+    2. Runs transcript through all 3 agents
+    3. Generates a professional formatted .txt report
+    4. Saves to database
+    5. Returns everything including the full formatted report text
+    """
+    if not file:
+        raise HTTPException(status_code=422, detail="No audio file provided.")
+
+    audio_bytes = await file.read()
+
+    if len(audio_bytes) == 0:
+        raise HTTPException(status_code=422, detail="Audio file is empty.")
+
+    # Step 1: Transcribe
+    try:
+        from agents.transcriber import transcribe_audio
+        transcription = transcribe_audio(audio_bytes, language)
+        transcript_text = transcription["transcript"]
+        duration = transcription.get("duration", 0.0)
+        detected_lang = transcription.get("language", language)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Transcription error: {str(e)}")
+
+    if not transcript_text.strip():
+        raise HTTPException(status_code=422, detail="Transcription returned empty text.")
+
+    # Step 2: Run pipeline
+    try:
+        from main import pipeline as langgraph_app
+        result = langgraph_app.invoke({
+            "transcript": transcript_text,
+            "summary": "",
+            "tasks": [],
+            "report": ""
+        })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Pipeline error: {str(e)}")
+
+    tasks = normalize_tasks(result.get("tasks", []))
+    summary = result.get("summary", "")
+    report = result.get("report", "")
+
+    # Step 3: Save to database
+    try:
+        meeting_id = save_meeting(
+            transcript=transcript_text,
+            summary=summary,
+            tasks=tasks,
+            report=report
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+    # Step 4: Generate formatted .txt report
+    try:
+        from agents.report_generator import generate_meeting_report, save_report_to_file
+        report_text = generate_meeting_report(
+            transcript=transcript_text,
+            summary=summary,
+            tasks=tasks,
+            report=report,
+            language=detected_lang,
+            duration=duration,
+            meeting_id=meeting_id
+        )
+        # Save to file automatically
+        save_report_to_file(report_text, meeting_id=meeting_id)
+    except Exception as e:
+        report_text = report  # fallback to plain report
+
+    return TranscribeAndProcessResponse(
+        meeting_id=meeting_id,
+        transcript=transcript_text,
+        language=detected_lang,
+        duration=duration,
+        summary=summary,
+        tasks=[TaskItem(**t) for t in tasks],
+        report=report,
+        report_text=report_text
+    )
+
+
+# ─────────────────────────────────────────────
+# DOWNLOAD REPORT AS .TXT FILE
+# ─────────────────────────────────────────────
+
+@router.get(
+    "/meetings/{meeting_id}/download",
+    tags=["Meetings"],
+    summary="Download meeting report as a formatted .txt file"
+)
+def download_meeting_report(meeting_id: int):
+    """
+    Generates and downloads the full meeting report as a .txt file.
+    Includes transcript, summary, action items, and follow-up report.
+    """
+    meeting = get_meeting_by_id(meeting_id)
+    if not meeting:
+        raise HTTPException(status_code=404, detail=f"Meeting {meeting_id} not found.")
+
+    try:
+        from agents.report_generator import generate_meeting_report, save_report_to_file
+
+        report_text = generate_meeting_report(
+            transcript=meeting.get("transcript", ""),
+            summary=meeting.get("summary", ""),
+            tasks=meeting.get("tasks", []),
+            report=meeting.get("report", ""),
+            language="en",
+            duration=0.0,
+            meeting_id=meeting_id
+        )
+
+        # Save to file
+        filepath = save_report_to_file(report_text, meeting_id=meeting_id)
+
+        return FileResponse(
+            path=filepath,
+            filename=f"meeting_{meeting_id}_report.txt",
+            media_type="text/plain"
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get(
+    "/meetings/{meeting_id}/report-text",
+    tags=["Meetings"],
+    summary="Get meeting report as plain text — no download"
+)
+def get_meeting_report_text(meeting_id: int):
+    """
+    Returns the formatted report as plain text in the response body.
+    Useful for displaying in the frontend without downloading.
+    """
+    meeting = get_meeting_by_id(meeting_id)
+    if not meeting:
+        raise HTTPException(status_code=404, detail=f"Meeting {meeting_id} not found.")
+
+    try:
+        from agents.report_generator import generate_meeting_report
+
+        report_text = generate_meeting_report(
+            transcript=meeting.get("transcript", ""),
+            summary=meeting.get("summary", ""),
+            tasks=meeting.get("tasks", []),
+            report=meeting.get("report", ""),
+            language="en",
+            duration=0.0,
+            meeting_id=meeting_id
+        )
+
+        return PlainTextResponse(content=report_text)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─────────────────────────────────────────────
+# MAIN PIPELINE
+# ─────────────────────────────────────────────
 
 @router.post(
     "/process-meeting",
@@ -107,7 +342,6 @@ def process_meeting(request: TranscriptRequest):
     if not request.transcript.strip():
         raise HTTPException(status_code=422, detail="Transcript cannot be empty.")
 
-    # Run LangGraph pipeline
     try:
         from main import pipeline as langgraph_app
         result = langgraph_app.invoke({
@@ -116,7 +350,6 @@ def process_meeting(request: TranscriptRequest):
             "tasks": [],
             "report": ""
         })
-    
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Pipeline error: {str(e)}")
 
@@ -124,7 +357,6 @@ def process_meeting(request: TranscriptRequest):
     summary = result.get("summary", "")
     report = result.get("report", "")
 
-    # Save to database
     try:
         meeting_id = save_meeting(
             transcript=request.transcript,
@@ -135,6 +367,20 @@ def process_meeting(request: TranscriptRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
+    # Auto-generate and save formatted report
+    try:
+        from agents.report_generator import generate_meeting_report, save_report_to_file
+        report_text = generate_meeting_report(
+            transcript=request.transcript,
+            summary=summary,
+            tasks=tasks,
+            report=report,
+            meeting_id=meeting_id
+        )
+        save_report_to_file(report_text, meeting_id=meeting_id)
+    except Exception:
+        pass  # don't fail the main response if report saving fails
+
     return MeetingResponse(
         meeting_id=meeting_id,
         summary=summary,
@@ -143,7 +389,9 @@ def process_meeting(request: TranscriptRequest):
     )
 
 
-# ── MEETING HISTORY ────────────────────────────
+# ─────────────────────────────────────────────
+# MEETING HISTORY
+# ─────────────────────────────────────────────
 
 @router.get(
     "/meetings",
@@ -151,9 +399,6 @@ def process_meeting(request: TranscriptRequest):
     summary="Get all past meetings"
 )
 def list_meetings():
-    """
-    Returns all processed meetings, most recent first.
-    """
     try:
         return get_all_meetings()
     except Exception as e:
@@ -166,16 +411,15 @@ def list_meetings():
     summary="Get a single meeting with all its tasks"
 )
 def get_meeting(meeting_id: int):
-    """
-    Returns a full meeting record including all extracted tasks.
-    """
     meeting = get_meeting_by_id(meeting_id)
     if not meeting:
         raise HTTPException(status_code=404, detail=f"Meeting {meeting_id} not found.")
     return meeting
 
 
-# ── TASK MANAGEMENT ────────────────────────────
+# ─────────────────────────────────────────────
+# TASK MANAGEMENT
+# ─────────────────────────────────────────────
 
 @router.get(
     "/tasks",
@@ -183,9 +427,6 @@ def get_meeting(meeting_id: int):
     summary="Get all tasks across all meetings"
 )
 def list_all_tasks():
-    """
-    Returns every task from every meeting — useful for a global task board.
-    """
     try:
         return get_all_tasks()
     except Exception as e:
@@ -199,7 +440,6 @@ def list_all_tasks():
 )
 def update_status(task_id: int, body: StatusUpdateRequest):
     """
-    Updates a task's status.
     Allowed values: Pending | In Progress | Done | Cancelled
     """
     try:
@@ -215,7 +455,9 @@ def update_status(task_id: int, body: StatusUpdateRequest):
     return {"task_id": task_id, "status": body.status, "updated": True}
 
 
-# ── AGENT ISOLATION ────────────────────────────
+# ─────────────────────────────────────────────
+# AGENT ISOLATION
+# ─────────────────────────────────────────────
 
 @router.post(
     "/summarize",
@@ -248,5 +490,7 @@ def extract_only(request: TranscriptRequest):
         return TasksOnlyResponse(tasks=[TaskItem(**t) for t in tasks])
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Extractor error: {str(e)}")
+
+
 
 
