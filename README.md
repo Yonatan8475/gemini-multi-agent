@@ -361,8 +361,7 @@ FOLLOW-UP REPORT
 Applied AI Solutions Development — George Brown College, Toronto 2025
 
 - 🔗 GitHub: [github.com/Yonatan8475](https://github.com/Yonatan8475)
-- 💼 Background: Electromechanical Engineering (AASTU) + Applied AI (GBC)
-- 🌍 Building: TruckGo Ethiopia — AI-powered freight matching platform
+
 
 ---
 
